@@ -1,65 +1,71 @@
 import streamlit as st
 import google.generativeai as genai
 from PIL import Image
+import requests
+from bs4 import BeautifulSoup
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Gemini Vision Chat", layout="wide")
-st.title("👁️ Gemini Vision Assistant")
+# --- CONFIG ---
+st.set_page_config(page_title="Multi-Modal Gemini", layout="wide")
+st.title("🌐 Multi-Image & Website Analyzer")
 
-# --- 1. SECURE API KEY SETUP ---
+# API Setup
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
     api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 
 if not api_key:
-    st.info("Please add your Gemini API key to continue.", icon="🔑")
+    st.info("Please add your API key.")
     st.stop()
 
 genai.configure(api_key=api_key)
-
-# --- 2. INITIALIZE SESSION STATE ---
-# This keeps the chat history alive even when the app reruns
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-# --- 3. SIDEBAR: IMAGE UPLOAD ---
-with st.sidebar:
-    st.header("Upload Image")
-    uploaded_file = st.file_uploader("Choose a picture...", type=["jpg", "jpeg", "png"])
-    if uploaded_file:
-        img = Image.open(uploaded_file)
-        st.image(img, caption="Preview", use_container_width=True)
-    
-    if st.button("Clear Chat"):
-        st.session_state.chat_history = []
-        st.rerun()
-
-# --- 4. MODEL SETUP ---
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# --- 5. CHAT INTERFACE ---
-# Display existing chat messages
-for role, text in st.session_state.chat_history:
-    with st.chat_message(role):
-        st.markdown(text)
+# --- SIDEBAR: INPUTS ---
+with st.sidebar:
+    st.header("Inputs")
+    # Multiple file uploader
+    uploaded_files = st.file_uploader("Upload Images", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
+    
+    # URL input
+    url_input = st.text_input("Website Link (optional)", placeholder="https://example.com")
 
-# Input for new message
-if user_input := st.chat_input("Ask something about the image..."):
-    if not uploaded_file:
-        st.error("Please upload an image first!")
-    else:
-        # Display user message
-        st.chat_message("user").markdown(user_input)
-        st.session_state.chat_history.append(("user", user_input))
+# --- UTILITY: WEB SCRAPER ---
+def get_site_text(url):
+    try:
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        # Get text and clean it up
+        return f"\n\nContent from {url}:\n" + soup.get_text()[:5000] # Limit to 5k chars
+    except Exception as e:
+        return f"\n(Could not read website: {e})"
 
-        # Generate Gemini response
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing..."):
-                try:
-                    # Pass both the text prompt and the image object
-                    response = model.generate_content([user_input, img])
-                    st.markdown(response.text)
-                    st.session_state.chat_history.append(("assistant", response.text))
-                except Exception as e:
-                    st.error(f"Error: {e}")
+# --- MAIN CHAT ---
+user_prompt = st.chat_input("Ask a question about the images and the website...")
+
+if user_prompt:
+    # 1. Start the prompt list with the user's text
+    content_payload = [user_prompt]
+    
+    # 2. Add Website Text if URL exists
+    if url_input:
+        with st.status("Reading website..."):
+            site_context = get_site_text(url_input)
+            content_payload.append(site_context)
+    
+    # 3. Add All Uploaded Images
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            img = Image.open(uploaded_file)
+            content_payload.append(img)
+            st.image(img, caption=uploaded_file.name, width=200)
+
+    # 4. Generate Response
+    with st.chat_message("assistant"):
+        with st.spinner("Processing everything..."):
+            try:
+                # content_payload is now a list: [text_prompt, site_text, img1, img2, ...]
+                response = model.generate_content(content_payload)
+                st.markdown(response.text)
+            except Exception as e:
+                st.error(f"Error: {e}")
