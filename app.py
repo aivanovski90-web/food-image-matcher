@@ -23,19 +23,18 @@ except KeyError:
     st.error("Missing GEMINI_API_KEY. Add it to Streamlit Secrets.")
     st.stop()
 
-# MODEL CHANGE: Using 2.5-Flash-Lite for 1,000 free requests per day
-MODEL_NAME = 'gemini-2.5-flash-lite'
-model = genai.GenerativeModel(MODEL_NAME)
+# HYBRID MODELS: High quota for text, high intelligence for vision
+text_model = genai.GenerativeModel('gemini-2.5-flash-lite') 
+vision_model = genai.GenerativeModel('gemini-3-flash-preview')
 
 # --- 3. HELPER: QUOTA-AWARE CALLS ---
-def safe_gemini_call(prompt_data, retries=3):
-    """Handles 429 errors by waiting for the quota window to reset."""
+def safe_gemini_call(target_model, prompt_data, retries=3):
+    """Handles 429 errors and directs calls to the chosen model."""
     for i in range(retries):
         try:
-            return model.generate_content(prompt_data, generation_config={"temperature": 0.2})
+            return target_model.generate_content(prompt_data, generation_config={"temperature": 0.1})
         except ResourceExhausted:
-            # Error 429: We wait slightly longer than the suggested 50s
-            st.warning(f"Quota reached. Pausing for 55 seconds to reset window... (Attempt {i+1})")
+            st.warning(f"Quota reached. Pausing for 55 seconds... (Attempt {i+1})")
             time.sleep(55)
         except Exception as e:
             st.error(f"AI Error: {e}")
@@ -43,9 +42,9 @@ def safe_gemini_call(prompt_data, retries=3):
     return None
 
 # --- 4. UI ---
-st.set_page_config(page_title="High-Quota Matcher", page_icon="📸")
-st.title("📸 High-Quota Menu Matcher")
-st.info(f"Using {MODEL_NAME} (1,000 free requests per day)")
+st.set_page_config(page_title="Hybrid Precision Matcher", page_icon="📸")
+st.title("📸 Hybrid Precision Menu Matcher")
+st.info("Using Hybrid Logic: Smart Vision for matches, High-Quota for extraction.")
 
 with st.sidebar:
     st.header("1. Settings")
@@ -58,15 +57,15 @@ with st.sidebar:
         preview_container.info("\n".join(st.session_state.preview_list))
 
 # --- 5. LOGIC ---
-if st.button("Start Processing"):
+if st.button("Start Processing Batch"):
     if not uploaded_files or not url:
         st.warning("Provide both images and a URL.")
     else:
         st.session_state.preview_list = []
         status_text = st.empty()
         
-        # A. SCRAPING
-        status_text.text("Extracting menu data...")
+        # A. SCRAPING (Uses High-Quota Lite Model)
+        status_text.text("Extracting menu data with descriptions...")
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
@@ -76,16 +75,16 @@ if st.button("Start Processing"):
                 raw_html = page.inner_html("body")
                 browser.close()
 
-            extract_prompt = f"Extract dish items. Return ONLY JSON list of objects: [{{'name': 'Dish', 'info': 'Desc'}}] HTML: {raw_html[:20000]}"
-            extraction = safe_gemini_call(extract_prompt)
+            extract_prompt = f"Extract dish items and descriptions. Return ONLY JSON list of objects: [{{'name': 'Dish', 'info': 'Desc'}}] HTML: {raw_html[:20000]}"
+            extraction = safe_gemini_call(text_model, extract_prompt)
             if not extraction: st.stop()
             
             structured_menu = json.loads(extraction.text.replace('```json', '').replace('```', '').strip())
         except Exception as e:
-            st.error(f"Failed during extraction: {e}")
+            st.error(f"Extraction failed: {e}")
             st.stop()
 
-        # B. VISION MATCHING
+        # B. VISION MATCHING (Uses Smart Flash Model)
         brand_name = url.split("//")[-1].split(".")[0].capitalize()
         temp_dir = f"./{brand_name}_output"
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
@@ -99,14 +98,19 @@ if st.button("Start Processing"):
             file_bytes = file.getvalue()
             matched_name = "Unmatched"
             
-            match_resp = safe_gemini_call([
-                f"Match image to item from: {structured_menu}. Return ONLY dish name.",
+            # Smart Vision Prompt
+            match_resp = safe_gemini_call(vision_model, [
+                f"""Analyze this image's ingredients and plating. 
+                Match it to an item from: {structured_menu}. 
+                Prioritize descriptions that mention visual ingredients you see.
+                Return ONLY the exact 'name' from the list.""",
                 {"mime_type": "image/jpeg", "data": file_bytes}
             ])
             
             if match_resp and match_resp.text:
                 matched_name = match_resp.text.strip()
             
+            # Sanitize and ensure 12/12 processing
             clean_name = re.sub(r'\W+', '_', matched_name).strip("_")
             count = name_tracker.get(clean_name, 0)
             name_tracker[clean_name] = count + 1
