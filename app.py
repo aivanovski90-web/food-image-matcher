@@ -1,125 +1,149 @@
 import streamlit as st
-import os, re, zipfile, shutil, json, time, base64
-from openai import OpenAI
+import google.generativeai as genai
+import os, re, zipfile, shutil, json, time
 from playwright.sync_api import sync_playwright
+from google.api_core.exceptions import ResourceExhausted
 
-# --- 1. BOOTSTRAPPER (Fixes missing browser error) ---
-# Playwright needs its browser binaries in the local cache
+# --- 1. PERSISTENCE ---
+if "zip_buffer" not in st.session_state:
+    st.session_state.zip_buffer = None
+if "zip_filename" not in st.session_state:
+    st.session_state.zip_filename = ""
+if "preview_list" not in st.session_state:
+    st.session_state.preview_list = []
+
+# --- 2. SETUP ---
 if not os.path.exists("/home/appuser/.cache/ms-playwright"):
-    with st.spinner("Initializing browser engine... this may take a minute."):
-        os.system("playwright install chromium")
-
-# --- 2. SETUP & AUTH ---
-st.set_page_config(page_title="Grok Menu Matcher", page_icon="🚀")
-
-if "zip_buffer" not in st.session_state: st.session_state.zip_buffer = None
-if "preview_list" not in st.session_state: st.session_state.preview_list = []
+    os.system("playwright install chromium")
 
 try:
-    client = OpenAI(
-        api_key=st.secrets["GROK_API_KEY"],
-        base_url="https://api.x.ai/v1" 
-    )
-except Exception:
-    st.error("Please add 'GROK_API_KEY' to your Streamlit Secrets.")
+    API_KEY = st.secrets["GEMINI_API_KEY"]
+    genai.configure(api_key=API_KEY)
+except KeyError:
+    st.error("Missing GEMINI_API_KEY. Add it to Streamlit Secrets.")
     st.stop()
 
-MODEL_NAME = "grok-4.1-fast"
+# HYBRID MODELS: High quota for text, high intelligence for vision
+text_model = genai.GenerativeModel('gemini-2.5-flash-lite') 
+vision_model = genai.GenerativeModel('gemini-3-flash-preview')
 
-# --- 3. HELPER: BATCH HANDLER ---
-def process_grok_batch(chunk_files, menu_items):
-    user_content = [{"type": "text", "text": f"Identify these {len(chunk_files)} images from this menu: {menu_items}. Return ONLY a JSON object: {{\"names\": [\"Name1\", \"Name2\"]}} in exact order."}]
-    
-    for f in chunk_files:
-        b64_img = base64.b64encode(f.getvalue()).decode("utf-8")
-        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
-    
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": user_content}],
-            response_format={"type": "json_object"}
-        )
-        return json.loads(response.choices[0].message.content).get("names", [])
-    except:
-        return ["Unmatched"] * len(chunk_files)
+# --- 3. HELPER: QUOTA-AWARE CALLS ---
+def safe_gemini_call(target_model, prompt_data, retries=3):
+    """Handles 429 errors and directs calls to the chosen model."""
+    for i in range(retries):
+        try:
+            return target_model.generate_content(prompt_data, generation_config={"temperature": 0.1})
+        except ResourceExhausted:
+            st.warning(f"Quota reached. Pausing for 55 seconds... (Attempt {i+1})")
+            time.sleep(55)
+        except Exception as e:
+            st.error(f"AI Error: {e}")
+            return None
+    return None
 
-# --- 4. MAIN UI ---
-st.title("🚀 Grok-Powered Menu Matcher")
+# --- 4. UI ---
+st.set_page_config(page_title="Hybrid Precision Matcher", page_icon="📸")
+st.title("📸 Hybrid Precision Menu Matcher")
+st.info("Using Hybrid Logic: Smart Vision for matches, High-Quota for extraction.")
+
 with st.sidebar:
     st.header("1. Settings")
-    uploaded_files = st.file_uploader("Upload Batch (Up to 500)", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'])
-    url = st.text_input("Restaurant Website URL")
+    uploaded_files = st.file_uploader("Images", accept_multiple_files=True, type=['png', 'jpg', 'jpeg'])
+    url = st.text_input("Restaurant URL")
     st.markdown("---")
     st.header("2. Live Preview")
-    preview = st.empty()
+    preview_container = st.empty()
     if st.session_state.preview_list:
-        preview.info("\n".join(st.session_state.preview_list))
+        preview_container.info("\n".join(st.session_state.preview_list))
 
-if st.button("Start Fast Batch Processing"):
+# --- 5. LOGIC ---
+if st.button("Start Processing Batch"):
     if not uploaded_files or not url:
-        st.warning("Please provide both a URL and images.")
+        st.warning("Provide both images and a URL.")
     else:
-        st.info("Scraping menu data...")
+        st.session_state.preview_list = []
+        status_text = st.empty()
+        
+        # A. SCRAPING (Uses High-Quota Lite Model)
+        status_text.text("Extracting menu data with descriptions...")
         try:
             with sync_playwright() as p:
-                # Optimized launch args for cloud environments
-                browser = p.chromium.launch(
-                    headless=True, 
-                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-                )
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
                 page = browser.new_page()
-                page.goto(url, wait_until="networkidle")
-                menu_html = page.inner_html("body")
+                page.goto(url, wait_until="commit", timeout=60000)
+                page.wait_for_timeout(3000) 
+                raw_html = page.inner_html("body")
                 browser.close()
 
-            # B. EXTRACT DISHES
-            extract = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": f"Extract all dish names from this HTML. Return ONLY a JSON list of strings. HTML: {menu_html[:25000]}"}]
-            )
-            menu_items = json.loads(extract.choices[0].message.content)
-
-            # C. BATCH PROCESSING
-            brand_name = url.split("//")[-1].split(".")[0].capitalize()
-            temp_dir = os.path.abspath(f"./{brand_name}")
-            if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-            os.makedirs(temp_dir)
+            extract_prompt = f"Extract dish items and descriptions. Return ONLY JSON list of objects: [{{'name': 'Dish', 'info': 'Desc'}}] HTML: {raw_html[:20000]}"
+            extraction = safe_gemini_call(text_model, extract_prompt)
+            if not extraction: st.stop()
             
-            name_tracker = {}
-            batch_size = 10 
-            
-            for i in range(0, len(uploaded_files), batch_size):
-                chunk = uploaded_files[i : i + batch_size]
-                matches = process_grok_batch(chunk, menu_items)
-                
-                for idx, file in enumerate(chunk):
-                    name = matches[idx] if idx < len(matches) else "Unmatched"
-                    clean_name = re.sub(r'[^a-zA-Z0-9]', '_', name).strip("_")
-                    
-                    count = name_tracker.get(clean_name, 0)
-                    name_tracker[clean_name] = count + 1
-                    final_filename = f"{clean_name}_{count}.jpg"
-                    
-                    with open(os.path.join(temp_dir, final_filename), "wb") as f:
-                        f.write(file.getvalue())
-                    
-                    st.session_state.preview_list.append(f"✅ {final_filename}")
-                    preview.info("\n".join(st.session_state.preview_list[-10:]))
-                
-                st.progress((i + len(chunk)) / len(uploaded_files))
-                time.sleep(1)
-
-            # D. ZIP & FINISH
-            zip_fn = f"{brand_name}_Results.zip"
-            with zipfile.ZipFile(zip_fn, 'w') as z:
-                for f in os.listdir(temp_dir): z.write(os.path.join(temp_dir, f), f)
-            
-            with open(zip_fn, "rb") as f: st.session_state.zip_buffer = f.read()
-            shutil.rmtree(temp_dir)
-            st.rerun()
+            structured_menu = json.loads(extraction.text.replace('```json', '').replace('```', '').strip())
         except Exception as e:
-            st.error(f"An error occurred: {e}")
+            st.error(f"Extraction failed: {e}")
+            st.stop()
 
+        # B. VISION MATCHING (Uses Smart Flash Model)
+        brand_name = url.split("//")[-1].split(".")[0].capitalize()
+        temp_dir = f"./{brand_name}_output"
+        if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        name_tracker = {} 
+        total = len(uploaded_files)
+        prog = st.progress(0)
+        
+        for idx, file in enumerate(uploaded_files):
+            file_bytes = file.getvalue()
+            matched_name = "Unmatched"
+            
+            # Smart Vision Prompt
+            match_resp = safe_gemini_call(vision_model, [
+                f"""Analyze this image's ingredients and plating. 
+                Match it to an item from: {structured_menu}. 
+                Prioritize descriptions that mention visual ingredients you see.
+                Return ONLY the exact 'name' from the list.""",
+                {"mime_type": "image/jpeg", "data": file_bytes}
+            ])
+            
+            if match_resp and match_resp.text:
+                matched_name = match_resp.text.strip()
+            
+            # Sanitize and ensure 12/12 processing
+            clean_name = re.sub(r'\W+', '_', matched_name).strip("_")
+            count = name_tracker.get(clean_name, 0)
+            name_tracker[clean_name] = count + 1
+            final_filename = f"{clean_name}_{count}.jpg"
+            
+            with open(os.path.join(temp_dir, final_filename), "wb") as f:
+                f.write(file_bytes)
+            
+            st.session_state.preview_list.append(f"✅ {final_filename}")
+            preview_container.info("\n".join(st.session_state.preview_list[-15:]))
+            prog.progress(int((idx + 1) / total * 100))
+
+        # C. PACKAGING
+        zip_name = f"{brand_name}_Photos.zip"
+        with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as z:
+            for f in os.listdir(temp_dir):
+                z.write(os.path.join(temp_dir, f), f)
+        
+        with open(zip_name, "rb") as f:
+            st.session_state.zip_buffer = f.read()
+        st.session_state.zip_filename = zip_name
+        
+        shutil.rmtree(temp_dir)
+        os.remove(zip_name)
+        st.rerun()
+
+# --- 6. PERSISTENT DOWNLOAD ---
 if st.session_state.zip_buffer:
-    st.download_button("💾 Download Results", st.session_state.zip_buffer, "Photos.zip")
+    st.success(f"Success! Processed {len(st.session_state.preview_list)} images.")
+    st.download_button(
+        label="💾 Download ZIP archive",
+        data=st.session_state.zip_buffer,
+        file_name=st.session_state.zip_filename,
+        mime="application/zip",
+        on_click="ignore" 
+    )
