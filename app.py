@@ -1,25 +1,24 @@
-import os
-
-# Auto-install Playwright browsers if they are missing
-if not os.path.exists("/home/appuser/.cache/ms-playwright"):
-    os.system("playwright install chromium")
 import streamlit as st
 import google.generativeai as genai
 import os, re, zipfile, shutil
 from playwright.sync_api import sync_playwright
 
-# --- SECURE CONFIGURATION ---
+# --- 1. CLOUD INSTALLATION FIX ---
+# Automatically install Playwright browser binaries on the first run
+if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+    os.system("playwright install chromium")
+
+# --- 2. CONFIGURATION & SECRETS ---
 try:
-    # Pulls key from Streamlit Cloud Secrets dashboard
     API_KEY = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=API_KEY)
 except KeyError:
-    st.error("Missing GEMINI_API_KEY. Please add it to your Streamlit Secrets dashboard.")
+    st.error("Missing GEMINI_API_KEY. Add it to Streamlit Cloud Settings > Secrets.")
     st.stop()
 
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# --- APP UI ---
+# --- 3. APP INTERFACE ---
 st.set_page_config(page_title="Menu Photo Packager", page_icon="📸")
 st.title("📸 Restaurant Menu Photo Packager")
 
@@ -35,20 +34,28 @@ if st.button("Start Processing Batch"):
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        # 1. SCRAPING PHASE (Playwright Engine)
+        # --- 4. SCRAPING PHASE (With Stealth Fixes) ---
         status_text.text("Connecting to restaurant website...")
+        menu_text = ""
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch()
+                # Launch with arguments to prevent bot detection from hanging
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
                 page = browser.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                
+                # Faster loading strategy (domcontentloaded) and longer timeout
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
+                # Give the site 5 seconds to finish any JS rendering
+                page.wait_for_timeout(5000) 
                 menu_text = page.inner_text("body")
                 browser.close()
         except Exception as e:
-            st.error(f"Scraping failed: {e}")
+            st.error(f"The website did not respond in time. Try a direct menu link. Error: {e}")
             st.stop()
 
-        # 2. ANALYSIS & PROCESSING PHASE
+        # --- 5. VISION & PROCESSING PHASE ---
+        # Extract Brand Name
         brand_match = re.search(r'https?://(?:www\.)?([^./]+)', url)
         brand_name = brand_match.group(1).capitalize() if brand_match else "Restaurant"
         
@@ -66,38 +73,40 @@ if st.button("Start Processing Batch"):
             for file in batch:
                 file_bytes = file.getvalue()
                 try:
-                    # Match Image via Gemini Vision (Classifier Mode)
+                    # Match Image via Gemini (Analysis mode only)
                     response = model.generate_content([
-                        f"Identify this food item from the following menu: {menu_text}. Return ONLY the dish name.",
+                        f"Identify this dish from the menu text provided: {menu_text}. Return ONLY the name.",
                         {"mime_type": "image/jpeg", "data": file_bytes}
                     ])
                     
                     matched_name = response.text.strip()
                     clean_name = re.sub(r'[^a-zA-Z0-9]', '_', matched_name).strip("_")
                     
+                    # Deduplication
                     count = name_tracker.get(clean_name, 0)
                     name_tracker[clean_name] = count + 1
                     suffix = f"_{count}" if count > 0 else ""
                     
-                    # Binary Write (1KB Fix)
+                    # 1KB Binary Write Fix
                     dest_path = os.path.join(temp_dir, f"{clean_name}{suffix}.jpg")
                     with open(dest_path, "wb") as f:
                         f.write(file_bytes)
                     
                     if os.path.getsize(dest_path) > 2000:
                         valid_count += 1
-                except:
-                    continue
+                except: continue
             
             progress_bar.progress(min(100, int((i + batch_size) / total_files * 100)))
 
-        # 3. ZIPPING & DOWNLOAD
+        # --- 6. ZIPPING & AUTO-DOWNLOAD ---
         if valid_count > 0:
-            zip_path = f"{brand_name}_Photos.zip"
-            with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as z:
+            zip_file_name = f"{brand_name}_Photos.zip"
+            with zipfile.ZipFile(zip_file_name, 'w', zipfile.ZIP_DEFLATED) as z:
                 for f in os.listdir(temp_dir):
                     z.write(os.path.join(temp_dir, f), f)
             
-            with open(zip_path, "rb") as f:
-                st.download_button("💾 Download ZIP", data=f, file_name=zip_path, use_container_width=True)
+            status_text.success(f"Success! Processed {valid_count} images.")
+            with open(zip_file_name, "rb") as f:
+                st.download_button("💾 Download ZIP archive", data=f, file_name=zip_file_name, use_container_width=True)
+            
             shutil.rmtree(temp_dir)
