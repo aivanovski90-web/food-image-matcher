@@ -2,6 +2,7 @@ import streamlit as st
 import google.generativeai as genai
 import os, re, zipfile, shutil, json, time
 from playwright.sync_api import sync_playwright
+from google.api_core.exceptions import ResourceExhausted
 
 # --- 1. PERSISTENCE ---
 if "zip_buffer" not in st.session_state:
@@ -22,34 +23,50 @@ except KeyError:
     st.error("Missing GEMINI_API_KEY. Add it to Streamlit Secrets.")
     st.stop()
 
-# Using Gemini 3 Flash for the largest context window and best reasoning
-model = genai.GenerativeModel('gemini-3-flash-preview')
+# MODEL CHANGE: Using 2.5-Flash-Lite for 1,000 free requests per day
+MODEL_NAME = 'gemini-2.5-flash-lite'
+model = genai.GenerativeModel(MODEL_NAME)
 
-# --- 3. UI ---
-st.set_page_config(page_title="High-Accuracy Matcher", page_icon="📸")
-st.title("📸 High-Accuracy Menu Matcher")
+# --- 3. HELPER: QUOTA-AWARE CALLS ---
+def safe_gemini_call(prompt_data, retries=3):
+    """Handles 429 errors by waiting for the quota window to reset."""
+    for i in range(retries):
+        try:
+            return model.generate_content(prompt_data, generation_config={"temperature": 0.2})
+        except ResourceExhausted:
+            # Error 429: We wait slightly longer than the suggested 50s
+            st.warning(f"Quota reached. Pausing for 55 seconds to reset window... (Attempt {i+1})")
+            time.sleep(55)
+        except Exception as e:
+            st.error(f"AI Error: {e}")
+            return None
+    return None
+
+# --- 4. UI ---
+st.set_page_config(page_title="High-Quota Matcher", page_icon="📸")
+st.title("📸 High-Quota Menu Matcher")
+st.info(f"Using {MODEL_NAME} (1,000 free requests per day)")
 
 with st.sidebar:
-    st.header("1. Upload & Settings")
+    st.header("1. Settings")
     uploaded_files = st.file_uploader("Images", accept_multiple_files=True, type=['png', 'jpg', 'jpeg'])
     url = st.text_input("Restaurant URL")
-    
     st.markdown("---")
     st.header("2. Live Preview")
     preview_container = st.empty()
     if st.session_state.preview_list:
         preview_container.info("\n".join(st.session_state.preview_list))
 
-# --- 4. LOGIC ---
-if st.button("Start High-Accuracy Match"):
+# --- 5. LOGIC ---
+if st.button("Start Processing"):
     if not uploaded_files or not url:
         st.warning("Provide both images and a URL.")
     else:
         st.session_state.preview_list = []
         status_text = st.empty()
         
-        # A. SCRAPING (Enhanced with Descriptions)
-        status_text.text("Extracting menu titles & ingredients...")
+        # A. SCRAPING
+        status_text.text("Extracting menu data...")
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
@@ -59,20 +76,16 @@ if st.button("Start High-Accuracy Match"):
                 raw_html = page.inner_html("body")
                 browser.close()
 
-            # PTCF Framework: Persona-Task-Context-Format
-            extract_prompt = f"""
-            Identify all menu items in this HTML. Include the name and its short description or ingredients.
-            Return ONLY a valid JSON list: [{{"name": "Dish", "info": "Description"}}]
-            HTML: {raw_html[:25000]}
-            """
-            extraction = model.generate_content(extract_prompt)
-            clean_json = extraction.text.replace('```json', '').replace('```', '').strip()
-            structured_menu = json.loads(clean_json)
+            extract_prompt = f"Extract dish items. Return ONLY JSON list of objects: [{{'name': 'Dish', 'info': 'Desc'}}] HTML: {raw_html[:20000]}"
+            extraction = safe_gemini_call(extract_prompt)
+            if not extraction: st.stop()
+            
+            structured_menu = json.loads(extraction.text.replace('```json', '').replace('```', '').strip())
         except Exception as e:
             st.error(f"Failed during extraction: {e}")
             st.stop()
 
-        # B. VISION MATCHING (Expert Mode)
+        # B. VISION MATCHING
         brand_name = url.split("//")[-1].split(".")[0].capitalize()
         temp_dir = f"./{brand_name}_output"
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
@@ -86,23 +99,14 @@ if st.button("Start High-Accuracy Match"):
             file_bytes = file.getvalue()
             matched_name = "Unmatched"
             
-            try:
-                # Expert Persona + Low Temperature (0.2) for precise matching
-                match_resp = model.generate_content([
-                    f"""
-                    You are a culinary expert. Match this image to the most likely item from this list: {structured_menu}.
-                    Consider the visual ingredients and compare them to the 'name' and 'info' descriptions.
-                    If unsure, return 'Unmatched'. Return ONLY the dish name string.
-                    """,
-                    {"mime_type": "image/jpeg", "data": file_bytes}
-                ], generation_config={"temperature": 0.2})
-                
-                if match_resp and match_resp.text:
-                    matched_name = match_resp.text.strip()
-            except: 
-                pass # Falls back to "Unmatched"
+            match_resp = safe_gemini_call([
+                f"Match image to item from: {structured_menu}. Return ONLY dish name.",
+                {"mime_type": "image/jpeg", "data": file_bytes}
+            ])
             
-            # Sanitize and Numbering
+            if match_resp and match_resp.text:
+                matched_name = match_resp.text.strip()
+            
             clean_name = re.sub(r'\W+', '_', matched_name).strip("_")
             count = name_tracker.get(clean_name, 0)
             name_tracker[clean_name] = count + 1
@@ -129,9 +133,9 @@ if st.button("Start High-Accuracy Match"):
         os.remove(zip_name)
         st.rerun()
 
-# --- 5. PERSISTENT DOWNLOAD ---
+# --- 6. PERSISTENT DOWNLOAD ---
 if st.session_state.zip_buffer:
-    st.success(f"Success! All {len(st.session_state.preview_list)} images processed.")
+    st.success(f"Success! Processed {len(st.session_state.preview_list)} images.")
     st.download_button(
         label="💾 Download ZIP archive",
         data=st.session_state.zip_buffer,
