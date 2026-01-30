@@ -8,28 +8,35 @@ from google.api_core.exceptions import ResourceExhausted
 if not os.path.exists("/home/appuser/.cache/ms-playwright"):
     os.system("playwright install chromium")
 
-# --- 2. CONFIGURATION ---
+# --- 2. CONFIGURATION & STATE ---
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=API_KEY)
 except KeyError:
-    st.error("Missing GEMINI_API_KEY. Add it to Streamlit Secrets.")
+    st.error("Missing GEMINI_API_KEY in Streamlit Secrets.")
     st.stop()
 
-# Optimized for 1,000 requests/day on Free Tier
+# Initialize Session State trackers for the monitor
+if "requests_used" not in st.session_state:
+    st.session_state.requests_used = 0
+if "quota_limit" not in st.session_state:
+    st.session_state.quota_limit = 1000 # Default for Flash-Lite
+
 MODEL_NAME = 'gemini-2.5-flash-lite'
 model = genai.GenerativeModel(MODEL_NAME)
 
-# --- 3. HELPER: RETRY LOGIC ---
+# --- 3. HELPER: RETRY & MONITOR ---
 def call_gemini_with_retry(prompt_data, max_retries=3):
-    """Handles 429 errors by backing off as suggested by the API."""
+    """Tracks usage and handles 429 errors with backoff."""
     for attempt in range(max_retries):
         try:
-            return model.generate_content(prompt_data, generation_config={"temperature": 0.2})
-        except ResourceExhausted as e:
-            # Extract suggested wait time or default to 35s
+            response = model.generate_content(prompt_data, generation_config={"temperature": 0.2})
+            # Increment successful request count
+            st.session_state.requests_used += 1 
+            return response
+        except ResourceExhausted:
             wait_seconds = 35 
-            st.warning(f"Quota reached. Sleeping {wait_seconds}s before retry {attempt+1}/{max_retries}...")
+            st.warning(f"Quota reached. Sleeping {wait_seconds}s (Attempt {attempt+1}/{max_retries})...")
             time.sleep(wait_seconds)
         except Exception as e:
             st.error(f"AI Error: {e}")
@@ -37,23 +44,37 @@ def call_gemini_with_retry(prompt_data, max_retries=3):
     return None
 
 # --- 4. UI SETUP ---
-st.set_page_config(page_title="High-Quota Matcher", page_icon="📸")
-st.title("📸 High-Quota Menu Matcher")
-st.info(f"Using {MODEL_NAME} (Higher Daily Limits)")
+st.set_page_config(page_title="Quota Monitor Pro", page_icon="📸")
+st.title("📸 Menu Matcher with Quota Monitor")
 
+# Display the Monitor in the Sidebar
 with st.sidebar:
-    st.header("Upload Settings")
+    st.header("📊 Quota Monitor")
+    remaining = max(0, st.session_state.quota_limit - st.session_state.requests_used)
+    
+    # Visual Progress Bar for daily quota
+    progress_val = min(1.0, st.session_state.requests_used / st.session_state.quota_limit)
+    st.progress(progress_val)
+    
+    col1, col2 = st.columns(2)
+    col1.metric("Used", st.session_state.requests_used)
+    col2.metric("Remaining", remaining)
+    st.caption("RPD resets at midnight Pacific Time")
+    
+    st.markdown("---")
+    st.header("Settings")
     uploaded_files = st.file_uploader("Upload Images (Max 500)", accept_multiple_files=True, type=['png', 'jpg', 'jpeg'])
     url = st.text_input("Restaurant Website URL")
 
-if st.button("Start Processing Batch"):
+# --- 5. MAIN LOGIC ---
+if st.button("Start Processing"):
     if not uploaded_files or not url:
         st.warning("Please provide a URL and upload images.")
     else:
         status_text = st.empty()
         
-        # A. SCRAPING PHASE
-        status_text.text("Extracting menu data...")
+        # A. SCRAPING
+        status_text.text("Connecting to website...")
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
@@ -63,26 +84,24 @@ if st.button("Start Processing Batch"):
                 raw_html = page.inner_html("body")
                 browser.close()
 
-            # Extraction with Retry
-            extract_prompt = f"Identify all menu items and descriptions from this HTML. Return ONLY a JSON list of objects: [{{'item': 'Name', 'info': 'Desc'}}] HTML: {raw_html[:20000]}"
+            status_text.text("Parsing menu structure...")
+            extract_prompt = f"Extract dish items. Return ONLY JSON list: ['Dish 1', 'Dish 2']. HTML: {raw_html[:20000]}"
             extraction = call_gemini_with_retry(extract_prompt)
             if not extraction: st.stop()
             
             clean_json = extraction.text.replace('```json', '').replace('```', '').strip()
             structured_menu = json.loads(clean_json)
         except Exception as e:
-            st.error(f"Extraction failed: {e}")
+            st.error(f"Scraping failed: {e}")
             st.stop()
 
-        # B. VISION MATCHING
-        brand_match = re.search(r'https?://(?:www\.)?([^./]+)', url)
-        brand_name = brand_match.group(1).capitalize() if brand_match else "Restaurant"
+        # B. VISION & MATCHING
+        brand_name = url.split("//")[-1].split(".")[0].capitalize() if url else "Restaurant"
         temp_dir = f"./{brand_name}_output"
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
         
-        progress_bar = st.progress(0)
-        name_tracker = {}
+        main_progress = st.progress(0)
         total_files = len(uploaded_files)
 
         for i in range(0, total_files, 5):
@@ -91,27 +110,23 @@ if st.button("Start Processing Batch"):
                 file_bytes = file.getvalue()
                 matched_name = "Unmatched"
                 
-                # Match attempt with Retry
                 match_resp = call_gemini_with_retry([
-                    f"Match this image to an item from: {structured_menu}. Return ONLY the 'item' name.",
+                    f"Match this to an item from: {structured_menu}. Return ONLY the name.",
                     {"mime_type": "image/jpeg", "data": file_bytes}
                 ])
                 
                 if match_resp and match_resp.text:
                     matched_name = match_resp.text.strip()
                 
-                # Sanitize & Save EVERY file
+                # Sanitize & Save
                 clean_name = re.sub(r'[^a-zA-Z0-9]', '_', matched_name).strip("_")
-                count = name_tracker.get(clean_name, 0)
-                name_tracker[clean_name] = count + 1
-                suffix = f"_{count}" if count > 0 else ""
-                
-                with open(os.path.join(temp_dir, f"{clean_name}{suffix}.jpg"), "wb") as f:
+                dest_path = os.path.join(temp_dir, f"{clean_name}_{i}.jpg")
+                with open(dest_path, "wb") as f:
                     f.write(file_bytes)
             
-            progress_bar.progress(min(100, int((i + 5) / total_files * 100)))
+            main_progress.progress(min(100, int((i + 5) / total_files * 100)))
 
-        # C. ZIP & DOWNLOAD
+        # C. ZIP & CLEANUP
         zip_name = f"{brand_name}_Photos.zip"
         with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as z:
             for f in os.listdir(temp_dir):
@@ -121,3 +136,4 @@ if st.button("Start Processing Batch"):
         with open(zip_name, "rb") as f:
             st.download_button("💾 Download ZIP", data=f, file_name=zip_name)
         shutil.rmtree(temp_dir)
+        st.rerun() # Refresh UI to update the Quota Monitor counts
