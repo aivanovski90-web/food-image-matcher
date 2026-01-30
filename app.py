@@ -4,7 +4,6 @@ import os, re, zipfile, shutil
 from playwright.sync_api import sync_playwright
 
 # --- 1. CLOUD INSTALLATION FIX ---
-# Checks for existing browsers and installs Chromium if missing
 if not os.path.exists("/home/appuser/.cache/ms-playwright"):
     os.system("playwright install chromium")
 
@@ -39,22 +38,17 @@ if st.button("Start Processing Batch"):
         menu_text = ""
         try:
             with sync_playwright() as p:
-                # LAUNCH FIX: Added stealth arguments to bypass bot blocks
                 browser = p.chromium.launch(
                     headless=True, 
                     args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
                 )
                 page = browser.new_page()
-                
-                # TIMEOUT FIX: Increased to 60s and using "commit" to get raw text faster
                 page.goto(url, wait_until="commit", timeout=60000)
-                
-                # Small wait for content to settle
                 page.wait_for_timeout(3000) 
                 menu_text = page.inner_text("body")
                 browser.close()
         except Exception as e:
-            st.error(f"Scraping failed: The website is blocking our browser or taking too long. Error: {e}")
+            st.error(f"Scraping failed: {e}")
             st.stop()
 
         # --- 5. VISION & PROCESSING ---
@@ -67,14 +61,14 @@ if st.button("Start Processing Batch"):
         
         valid_count = 0
         name_tracker = {}
-        batch_size = 5 # Memory Fix for high-volume uploads
+        batch_size = 5 
+        total_files = len(uploaded_files)
         
-        for i in range(0, len(uploaded_files), batch_size):
+        for i in range(0, total_files, batch_size):
             batch = uploaded_files[i : i + batch_size]
             for file in batch:
                 file_bytes = file.getvalue()
                 try:
-                    # Match Image (AI vision analysis)
                     response = model.generate_content([
                         f"Identify this dish from the menu: {menu_text}. Return ONLY the name.",
                         {"mime_type": "image/jpeg", "data": file_bytes}
@@ -83,13 +77,18 @@ if st.button("Start Processing Batch"):
                     matched_name = response.text.strip()
                     clean_name = re.sub(r'[^a-zA-Z0-9]', '_', matched_name).strip("_")
                     
-                    # 1KB FIX: Using direct binary write to ensure full file quality
-                    dest_path = os.path.join(temp_dir, f"{clean_name}_{valid_count}.jpg")
+                    count = name_tracker.get(clean_name, 0)
+                    name_tracker[clean_name] = count + 1
+                    suffix = f"_{count}" if count > 0 else ""
+                    
+                    dest_path = os.path.join(temp_dir, f"{clean_name}{suffix}.jpg")
                     with open(dest_path, "wb") as f:
                         f.write(file_bytes)
                     valid_count += 1
                 except: continue
-            progress_bar.progress(int((i + batch_size) / len(uploaded_files) * 100))
+            
+            # MATH FIX: Added min(100, ...) to prevent out-of-range error
+            progress_bar.progress(min(100, int((i + batch_size) / total_files * 100)))
 
         # --- 6. ZIP & DOWNLOAD ---
         if valid_count > 0:
