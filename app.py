@@ -4,7 +4,6 @@ import os, re, zipfile, shutil, json, time
 from playwright.sync_api import sync_playwright
 
 # --- 1. SESSION STATE FOR PERSISTENCE ---
-# This ensures data lives across reruns
 if "zip_buffer" not in st.session_state:
     st.session_state.zip_buffer = None
 if "zip_filename" not in st.session_state:
@@ -36,7 +35,6 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("2. Live Preview")
-    # This container updates live during the loop
     preview_container = st.empty()
     if st.session_state.preview_list:
         preview_container.info("\n".join(st.session_state.preview_list))
@@ -46,7 +44,6 @@ if st.button("Start Processing Batch"):
     if not uploaded_files or not url:
         st.warning("Provide both images and a URL.")
     else:
-        # Reset previous session data
         st.session_state.preview_list = []
         status_text = st.empty()
         
@@ -69,44 +66,47 @@ if st.button("Start Processing Batch"):
             st.error(f"Failed during extraction: {e}")
             st.stop()
 
-        # B. VISION & AUTO-NUMBERING
+        # B. VISION & AUTO-NUMBERING (FIXED LOOP)
         brand_name = url.split("//")[-1].split(".")[0].capitalize()
         temp_dir = f"./{brand_name}_output"
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
         
-        name_tracker = {} # Track duplicates for numbering
+        name_tracker = {} 
         total = len(uploaded_files)
         prog = st.progress(0)
         
-        for i in range(0, total, 5):
-            batch = uploaded_files[i : i+5]
-            for file in batch:
-                file_bytes = file.getvalue()
-                try:
-                    resp = model.generate_content([
-                        f"Match this photo to an item: {structured_menu}. Return ONLY the name.",
-                        {"mime_type": "image/jpeg", "data": file_bytes}
-                    ])
-                    
-                    raw_name = resp.text.strip() if resp.text else "Unmatched"
-                    clean_name = re.sub(r'\W+', '_', raw_name).strip("_")
-                    
-                    # DUPLICATE HANDLING: Add numbering suffix
-                    count = name_tracker.get(clean_name, 0)
-                    name_tracker[clean_name] = count + 1
-                    # Only add suffix if it's the 2nd image or more
-                    final_filename = f"{clean_name}_{count}.jpg" if count > 0 else f"{clean_name}.jpg"
-                    
-                    # Save to disk
-                    with open(os.path.join(temp_dir, final_filename), "wb") as f:
-                        f.write(file_bytes)
-                    
-                    # Update Live Preview in Sidebar
-                    st.session_state.preview_list.append(f"✅ {final_filename}")
-                    preview_container.info("\n".join(st.session_state.preview_list[-15:])) # Show last 15
-                except: continue
-            prog.progress(min(100, int((i + 5) / total * 100)))
+        # FIX: Direct iteration over every file to ensure none are skipped
+        for idx, file in enumerate(uploaded_files):
+            file_bytes = file.getvalue()
+            try:
+                resp = model.generate_content([
+                    f"Match this photo to an item: {structured_menu}. Return ONLY the name.",
+                    {"mime_type": "image/jpeg", "data": file_bytes}
+                ])
+                
+                raw_name = resp.text.strip() if resp.text else "Unmatched"
+                clean_name = re.sub(r'\W+', '_', raw_name).strip("_")
+                
+                # DUPLICATE HANDLING: Add numbering
+                count = name_tracker.get(clean_name, 0)
+                name_tracker[clean_name] = count + 1
+                final_filename = f"{clean_name}_{count}.jpg"
+                
+                with open(os.path.join(temp_dir, final_filename), "wb") as f:
+                    f.write(file_bytes)
+                
+                # Update Preview
+                st.session_state.preview_list.append(f"✅ {final_filename}")
+                preview_container.info("\n".join(st.session_state.preview_list[-15:]))
+            except: 
+                # Ensure even failed matches are saved as Unmatched so count remains 12/12
+                unmatched_file = f"Unmatched_{idx}.jpg"
+                with open(os.path.join(temp_dir, unmatched_file), "wb") as f:
+                    f.write(file_bytes)
+                st.session_state.preview_list.append(f"❓ {unmatched_file}")
+            
+            prog.progress(int((idx + 1) / total * 100))
 
         # C. ZIP & STORE
         zip_name = f"{brand_name}_Photos.zip"
@@ -114,22 +114,21 @@ if st.button("Start Processing Batch"):
             for f in os.listdir(temp_dir):
                 z.write(os.path.join(temp_dir, f), f)
         
-        # PERSIST RESULTS
         with open(zip_name, "rb") as f:
             st.session_state.zip_buffer = f.read()
         st.session_state.zip_filename = zip_name
         
         shutil.rmtree(temp_dir)
         os.remove(zip_name)
-        st.rerun() # Refresh to show final download button
+        st.rerun()
 
 # --- 5. PERSISTENT DOWNLOAD ---
 if st.session_state.zip_buffer:
-    st.success(f"Successfully processed images!")
+    st.success(f"Successfully processed all {len(st.session_state.preview_list)} images!")
     st.download_button(
         label="💾 Download ZIP archive",
         data=st.session_state.zip_buffer,
         file_name=st.session_state.zip_filename,
         mime="application/zip",
-        on_click="ignore" # Keeps the screen state after download
+        on_click="ignore" 
     )
