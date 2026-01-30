@@ -1,3 +1,8 @@
+import os
+
+# Auto-install Playwright browsers if they are missing
+if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+    os.system("playwright install chromium")
 import streamlit as st
 import google.generativeai as genai
 import os, re, zipfile, shutil
