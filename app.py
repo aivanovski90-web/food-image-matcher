@@ -64,7 +64,7 @@ if st.button("Start Processing Batch"):
         st.session_state.preview_list = []
         status_text = st.empty()
         
-        # A. SCRAPING
+        # A. SCRAPING (Uses High-Quota Lite Model)
         status_text.text("Extracting menu data with descriptions...")
         try:
             with sync_playwright() as p:
@@ -75,7 +75,7 @@ if st.button("Start Processing Batch"):
                 raw_html = page.inner_html("body")
                 browser.close()
 
-            extract_prompt = f"Extract dish items and descriptions. Return ONLY JSON list: [{{'name': 'Dish', 'info': 'Desc'}}] HTML: {raw_html[:20000]}"
+            extract_prompt = f"Extract dish items and descriptions. Return ONLY JSON list of objects: [{{'name': 'Dish', 'info': 'Desc'}}] HTML: {raw_html[:20000]}"
             extraction = safe_gemini_call(text_model, extract_prompt)
             if not extraction: st.stop()
             
@@ -84,49 +84,46 @@ if st.button("Start Processing Batch"):
             st.error(f"Extraction failed: {e}")
             st.stop()
 
-        # B. DIRECTORY SETUP (OSError Fix)
-        brand_match = re.search(r'https?://(?:www\.)?([^./]+)', url)
-        brand_name = brand_match.group(1).capitalize() if brand_match else "Restaurant"
-        
-        # Use absolute path to ensure Streamlit Cloud finds it
-        temp_dir = os.path.abspath(f"./{brand_name}_output")
-        if os.path.exists(temp_dir): 
-            shutil.rmtree(temp_dir)
+        # B. VISION MATCHING (Uses Smart Flash Model)
+        brand_name = url.split("//")[-1].split(".")[0].capitalize()
+        temp_dir = f"./{brand_name}_output"
+        if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
         
         name_tracker = {} 
         total = len(uploaded_files)
         prog = st.progress(0)
         
-        # C. VISION MATCHING
         for idx, file in enumerate(uploaded_files):
             file_bytes = file.getvalue()
             matched_name = "Unmatched"
             
+            # Smart Vision Prompt
             match_resp = safe_gemini_call(vision_model, [
-                f"Analyze image. Match to: {structured_menu}. Return ONLY the exact 'name'.",
+                f"""Analyze this image's ingredients and plating. 
+                Match it to an item from: {structured_menu}. 
+                Prioritize descriptions that mention visual ingredients you see.
+                Return ONLY the exact 'name' from the list.""",
                 {"mime_type": "image/jpeg", "data": file_bytes}
             ])
             
             if match_resp and match_resp.text:
                 matched_name = match_resp.text.strip()
             
-            # FILENAME FIX: Remove all non-alphanumeric to prevent OSErrors
-            clean_name = re.sub(r'[^a-zA-Z0-9]', '_', matched_name).strip("_")
+            # Sanitize and ensure 12/12 processing
+            clean_name = re.sub(r'\W+', '_', matched_name).strip("_")
             count = name_tracker.get(clean_name, 0)
             name_tracker[clean_name] = count + 1
             final_filename = f"{clean_name}_{count}.jpg"
             
-            # WRITING DATA (Full Return Fix)
-            file_path = os.path.join(temp_dir, final_filename)
-            with open(file_path, "wb") as f:
+            with open(os.path.join(temp_dir, final_filename), "wb") as f:
                 f.write(file_bytes)
             
             st.session_state.preview_list.append(f"✅ {final_filename}")
             preview_container.info("\n".join(st.session_state.preview_list[-15:]))
             prog.progress(int((idx + 1) / total * 100))
 
-        # D. PACKAGING
+        # C. PACKAGING
         zip_name = f"{brand_name}_Photos.zip"
         with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as z:
             for f in os.listdir(temp_dir):
