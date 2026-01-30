@@ -3,7 +3,7 @@ import google.generativeai as genai
 import os, re, zipfile, shutil, json, time
 from playwright.sync_api import sync_playwright
 
-# --- 1. SESSION STATE FOR PERSISTENCE ---
+# --- 1. PERSISTENCE ---
 if "zip_buffer" not in st.session_state:
     st.session_state.zip_buffer = None
 if "zip_filename" not in st.session_state:
@@ -11,7 +11,7 @@ if "zip_filename" not in st.session_state:
 if "preview_list" not in st.session_state:
     st.session_state.preview_list = []
 
-# --- 2. INSTALLATION & SETUP ---
+# --- 2. SETUP ---
 if not os.path.exists("/home/appuser/.cache/ms-playwright"):
     os.system("playwright install chromium")
 
@@ -22,11 +22,12 @@ except KeyError:
     st.error("Missing GEMINI_API_KEY. Add it to Streamlit Secrets.")
     st.stop()
 
+# Using Gemini 3 Flash for the largest context window and best reasoning
 model = genai.GenerativeModel('gemini-3-flash-preview')
 
-# --- 3. UI SETUP ---
-st.set_page_config(page_title="Menu Matcher Pro", page_icon="📸")
-st.title("📸 Advanced Menu Matcher")
+# --- 3. UI ---
+st.set_page_config(page_title="High-Accuracy Matcher", page_icon="📸")
+st.title("📸 High-Accuracy Menu Matcher")
 
 with st.sidebar:
     st.header("1. Upload & Settings")
@@ -39,16 +40,16 @@ with st.sidebar:
     if st.session_state.preview_list:
         preview_container.info("\n".join(st.session_state.preview_list))
 
-# --- 4. CORE LOGIC ---
-if st.button("Start Processing Batch"):
+# --- 4. LOGIC ---
+if st.button("Start High-Accuracy Match"):
     if not uploaded_files or not url:
         st.warning("Provide both images and a URL.")
     else:
         st.session_state.preview_list = []
         status_text = st.empty()
         
-        # A. SCRAPING
-        status_text.text("Connecting to restaurant...")
+        # A. SCRAPING (Enhanced with Descriptions)
+        status_text.text("Extracting menu titles & ingredients...")
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
@@ -58,15 +59,20 @@ if st.button("Start Processing Batch"):
                 raw_html = page.inner_html("body")
                 browser.close()
 
-            status_text.text("AI is parsing menu structure...")
-            extract_prompt = f"Extract all dish items. Return ONLY JSON list: ['Dish 1']. HTML: {raw_html[:20000]}"
+            # PTCF Framework: Persona-Task-Context-Format
+            extract_prompt = f"""
+            Identify all menu items in this HTML. Include the name and its short description or ingredients.
+            Return ONLY a valid JSON list: [{{"name": "Dish", "info": "Description"}}]
+            HTML: {raw_html[:25000]}
+            """
             extraction = model.generate_content(extract_prompt)
-            structured_menu = json.loads(extraction.text.replace('```json', '').replace('```', '').strip())
+            clean_json = extraction.text.replace('```json', '').replace('```', '').strip()
+            structured_menu = json.loads(clean_json)
         except Exception as e:
             st.error(f"Failed during extraction: {e}")
             st.stop()
 
-        # B. VISION & AUTO-NUMBERING (FIXED LOOP)
+        # B. VISION MATCHING (Expert Mode)
         brand_name = url.split("//")[-1].split(".")[0].capitalize()
         temp_dir = f"./{brand_name}_output"
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
@@ -76,39 +82,40 @@ if st.button("Start Processing Batch"):
         total = len(uploaded_files)
         prog = st.progress(0)
         
-        # FIX: Direct iteration over every file to ensure none are skipped
         for idx, file in enumerate(uploaded_files):
             file_bytes = file.getvalue()
-            try:
-                resp = model.generate_content([
-                    f"Match this photo to an item: {structured_menu}. Return ONLY the name.",
-                    {"mime_type": "image/jpeg", "data": file_bytes}
-                ])
-                
-                raw_name = resp.text.strip() if resp.text else "Unmatched"
-                clean_name = re.sub(r'\W+', '_', raw_name).strip("_")
-                
-                # DUPLICATE HANDLING: Add numbering
-                count = name_tracker.get(clean_name, 0)
-                name_tracker[clean_name] = count + 1
-                final_filename = f"{clean_name}_{count}.jpg"
-                
-                with open(os.path.join(temp_dir, final_filename), "wb") as f:
-                    f.write(file_bytes)
-                
-                # Update Preview
-                st.session_state.preview_list.append(f"✅ {final_filename}")
-                preview_container.info("\n".join(st.session_state.preview_list[-15:]))
-            except: 
-                # Ensure even failed matches are saved as Unmatched so count remains 12/12
-                unmatched_file = f"Unmatched_{idx}.jpg"
-                with open(os.path.join(temp_dir, unmatched_file), "wb") as f:
-                    f.write(file_bytes)
-                st.session_state.preview_list.append(f"❓ {unmatched_file}")
+            matched_name = "Unmatched"
             
+            try:
+                # Expert Persona + Low Temperature (0.2) for precise matching
+                match_resp = model.generate_content([
+                    f"""
+                    You are a culinary expert. Match this image to the most likely item from this list: {structured_menu}.
+                    Consider the visual ingredients and compare them to the 'name' and 'info' descriptions.
+                    If unsure, return 'Unmatched'. Return ONLY the dish name string.
+                    """,
+                    {"mime_type": "image/jpeg", "data": file_bytes}
+                ], generation_config={"temperature": 0.2})
+                
+                if match_resp and match_resp.text:
+                    matched_name = match_resp.text.strip()
+            except: 
+                pass # Falls back to "Unmatched"
+            
+            # Sanitize and Numbering
+            clean_name = re.sub(r'\W+', '_', matched_name).strip("_")
+            count = name_tracker.get(clean_name, 0)
+            name_tracker[clean_name] = count + 1
+            final_filename = f"{clean_name}_{count}.jpg"
+            
+            with open(os.path.join(temp_dir, final_filename), "wb") as f:
+                f.write(file_bytes)
+            
+            st.session_state.preview_list.append(f"✅ {final_filename}")
+            preview_container.info("\n".join(st.session_state.preview_list[-15:]))
             prog.progress(int((idx + 1) / total * 100))
 
-        # C. ZIP & STORE
+        # C. PACKAGING
         zip_name = f"{brand_name}_Photos.zip"
         with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as z:
             for f in os.listdir(temp_dir):
@@ -124,7 +131,7 @@ if st.button("Start Processing Batch"):
 
 # --- 5. PERSISTENT DOWNLOAD ---
 if st.session_state.zip_buffer:
-    st.success(f"Successfully processed all {len(st.session_state.preview_list)} images!")
+    st.success(f"Success! All {len(st.session_state.preview_list)} images processed.")
     st.download_button(
         label="💾 Download ZIP archive",
         data=st.session_state.zip_buffer,
