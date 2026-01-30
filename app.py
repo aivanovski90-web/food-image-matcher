@@ -3,79 +3,85 @@ import os, re, zipfile, shutil, json, time, base64
 from openai import OpenAI
 from playwright.sync_api import sync_playwright
 
-# --- 1. SESSION STATE & AUTH ---
+# --- 1. SETUP & AUTH ---
+st.set_page_config(page_title="Grok Menu Matcher", page_icon="🚀")
+
 if "zip_buffer" not in st.session_state: st.session_state.zip_buffer = None
 if "preview_list" not in st.session_state: st.session_state.preview_list = []
 
 try:
+    # Uses the GROK_API_KEY from your Streamlit Secrets
     client = OpenAI(
         api_key=st.secrets["GROK_API_KEY"],
-        base_url="https://api.x.ai/v1" # Compatible with OpenAI SDK
+        base_url="https://api.x.ai/v1" 
     )
-except:
-    st.error("Add GROK_API_KEY to Streamlit Secrets.")
+except Exception as e:
+    st.error("Please add 'GROK_API_KEY' to your Streamlit Secrets.")
     st.stop()
 
-# Grok 4.1 Fast is the best intelligence-to-cost ratio in 2026
+# Using Grok 4.1 Fast for high-speed, low-cost processing
 MODEL_NAME = "grok-4.1-fast"
 
 # --- 2. BATCH HANDLER ---
 def process_grok_batch(chunk_files, menu_items):
-    """Processes images in groups of 10 to maximize token efficiency."""
-    messages = [
-        {"role": "system", "content": f"Match these {len(chunk_files)} images to items in: {menu_items}. Return ONLY a JSON list of names in exact order."},
-    ]
+    """Groups images into one request to save API quota."""
+    user_content = [{"type": "text", "text": f"Identify these {len(chunk_files)} images from this menu: {menu_items}. Return ONLY a JSON object: {{\"names\": [\"Name1\", \"Name2\"]}} in exact order."}]
     
-    user_content = []
     for f in chunk_files:
-        # Encode image to Base64 for the API
         b64_img = base64.b64encode(f.getvalue()).decode("utf-8")
         user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
-    
-    messages.append({"role": "user", "content": user_content})
     
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=messages,
-            response_format={"type": "json_object"} # Force structured data
+            messages=[{"role": "user", "content": user_content}],
+            response_format={"type": "json_object"}
         )
         return json.loads(response.choices[0].message.content).get("names", [])
     except:
         return ["Unmatched"] * len(chunk_files)
 
-# --- 3. MAIN UI & LOGIC ---
+# --- 3. UI & LOGIC ---
 st.title("🚀 Grok-Powered Menu Matcher")
 with st.sidebar:
-    uploaded_files = st.file_uploader("Upload Batch (Up to 500)", accept_multiple_files=True)
+    st.header("1. Settings")
+    uploaded_files = st.file_uploader("Upload Batch (Up to 500)", accept_multiple_files=True, type=['jpg', 'jpeg', 'png'])
     url = st.text_input("Restaurant Website URL")
+    st.markdown("---")
+    st.header("2. Live Preview")
     preview = st.empty()
+    if st.session_state.preview_list:
+        preview.info("\n".join(st.session_state.preview_list))
 
 if st.button("Start Fast Batch Processing"):
-    if uploaded_files and url:
+    if not uploaded_files or not url:
+        st.warning("Please provide both a URL and images.")
+    else:
         # A. SCRAPE
+        st.info("Scraping menu data...")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # Install browser on first run
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
             page = browser.new_page()
             page.goto(url)
             menu_html = page.inner_html("body")
             browser.close()
 
-        # B. EXTRACT MENU
+        # B. EXTRACT DISHES
         extract = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[{"role": "user", "content": f"Extract all dish names from this HTML. Return JSON list ['Name']. HTML: {menu_html[:25000]}"}]
+            messages=[{"role": "user", "content": f"Extract all dish names from this HTML. Return ONLY a JSON list of strings. HTML: {menu_html[:25000]}"}]
         )
         menu_items = json.loads(extract.choices[0].message.content)
 
-        # C. BATCH IMAGE PROCESSING
+        # C. BATCH PROCESSING
         brand_name = url.split("//")[-1].split(".")[0].capitalize()
         temp_dir = os.path.abspath(f"./{brand_name}")
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         os.makedirs(temp_dir)
         
         name_tracker = {}
-        batch_size = 10 # Grok handles up to 10 images smoothly
+        batch_size = 10 # Efficiency: 10 images per request
         
         for i in range(0, len(uploaded_files), batch_size):
             chunk = uploaded_files[i : i + batch_size]
@@ -88,18 +94,18 @@ if st.button("Start Fast Batch Processing"):
                 # Handling Duplicates
                 count = name_tracker.get(clean_name, 0)
                 name_tracker[clean_name] = count + 1
-                fname = f"{clean_name}_{count}.jpg"
+                final_filename = f"{clean_name}_{count}.jpg"
                 
-                with open(os.path.join(temp_dir, fname), "wb") as f:
+                with open(os.path.join(temp_dir, final_filename), "wb") as f:
                     f.write(file.getvalue())
                 
-                st.session_state.preview_list.append(f"✅ {fname}")
+                st.session_state.preview_list.append(f"✅ {final_filename}")
                 preview.info("\n".join(st.session_state.preview_list[-10:]))
             
             st.progress((i + len(chunk)) / len(uploaded_files))
-            time.sleep(0.5) # Short rest for stability
+            time.sleep(1) # Safety delay
 
-        # D. ZIP & DOWNLOAD
+        # D. ZIP & FINISH
         zip_fn = f"{brand_name}_Results.zip"
         with zipfile.ZipFile(zip_fn, 'w') as z:
             for f in os.listdir(temp_dir): z.write(os.path.join(temp_dir, f), f)
