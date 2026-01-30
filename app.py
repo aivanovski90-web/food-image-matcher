@@ -1,59 +1,119 @@
-# --- 5. VISION & PROCESSING (FULL-RETURN FIX) ---
-brand_name = url.split("//")[-1].split(".")[0].capitalize() if url else "Custom_Restaurant"
-temp_dir = f"./{brand_name}_output"
-if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-os.makedirs(temp_dir, exist_ok=True)
+import streamlit as st
+import google.generativeai as genai
+import os, re, zipfile, shutil, json
+from playwright.sync_api import sync_playwright
 
-progress_bar = st.progress(0)
-processed_count = 0
-name_tracker = {}
-total_files = len(uploaded_files)
+# --- 1. CLOUD INSTALLATION ---
+# Ensures the Chromium browser is installed on the Streamlit server
+if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+    os.system("playwright install chromium")
 
-# Batch size of 5 for memory safety
-for i in range(0, total_files, 5):
-    batch = uploaded_files[i : i + 5]
-    for file in batch:
-        file_bytes = file.getvalue()
-        matched_name = "Unmatched" # DEFAULT FALLBACK NAME
+# --- 2. CONFIGURATION & SECRETS ---
+try:
+    # Pulls your rotated API key from the Streamlit Secrets dashboard
+    API_KEY = st.secrets["GEMINI_API_KEY"]
+    genai.configure(api_key=API_KEY)
+except KeyError:
+    st.error("Missing GEMINI_API_KEY. Please add it to Streamlit Secrets.")
+    st.stop()
+
+# Use Gemini 3 Flash for the best balance of speed and large HTML context
+model = genai.GenerativeModel('gemini-3-flash-preview')
+
+# --- 3. UI SETUP ---
+st.set_page_config(page_title="Menu Matcher Pro", page_icon="📸")
+st.title("📸 Restaurant Menu Photo Matcher")
+
+# Variable Initialization to prevent NameError
+url = ""
+brand_name = "Custom_Restaurant"
+
+with st.sidebar:
+    st.header("1. Settings")
+    uploaded_files = st.file_uploader("Upload Images (Max 500)", accept_multiple_files=True, type=['png', 'jpg', 'jpeg'])
+    url = st.text_input("Restaurant Website URL")
+
+# Safely set brand_name only if url is provided
+if url:
+    brand_match = re.search(r'https?://(?:www\.)?([^./]+)', url)
+    brand_name = brand_match.group(1).capitalize() if brand_match else "Restaurant"
+
+# --- 4. MAIN PROCESSING LOGIC ---
+if st.button("Start Processing Batch"):
+    if not uploaded_files or not url:
+        st.warning("Please upload images and enter a restaurant URL.")
+    else:
+        status_text = st.empty()
+        structured_menu = []
         
+        # A. SCRAPING PHASE (Opal Logic)
+        status_text.text("Extracting menu data from website...")
         try:
-            # AI Matching Attempt
-            match_resp = model.generate_content([
-                f"From this menu list: {structured_menu}, which dish is this image? Return ONLY the exact name. If you are not sure, return 'Unmatched'.",
-                {"mime_type": "image/jpeg", "data": file_bytes}
-            ])
-            
-            # Use the AI result if it successfully returned text
-            if match_resp and match_resp.text:
-                matched_name = match_resp.text.strip()
-        except Exception:
-            # If the API fails or times out, matched_name remains "Unmatched"
-            pass
-            
-        # SANITIZE & SAVE EVERY FILE
-        clean_name = re.sub(r'[^a-zA-Z0-9]', '_', matched_name).strip("_")
-        
-        # Deduplication tracker
-        count = name_tracker.get(clean_name, 0)
-        name_tracker[clean_name] = count + 1
-        suffix = f"_{count}" if count > 0 else ""
-        
-        # Save to temp directory (1KB Binary Fix)
-        dest_path = os.path.join(temp_dir, f"{clean_name}{suffix}.jpg")
-        with open(dest_path, "wb") as f:
-            f.write(file_bytes)
-        processed_count += 1
-            
-    progress_bar.progress(min(100, int((i + 5) / total_files * 100))) # Progress Math Fix
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+                page = browser.new_page()
+                page.goto(url, wait_until="commit", timeout=60000)
+                page.wait_for_timeout(3000) 
+                raw_html = page.inner_html("body")
+                browser.close()
 
-# --- 6. ZIP & DOWNLOAD (WILL NOW CONTAIN ALL FILES) ---
-if processed_count > 0:
-    zip_name = f"{brand_name}_Photos.zip"
-    with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as z:
-        for f in os.listdir(temp_dir):
-            z.write(os.path.join(temp_dir, f), f)
-    
-    st.success(f"Complete! All {processed_count} images are ready in the ZIP.")
-    with open(zip_name, "rb") as f:
-        st.download_button("💾 Download Results", data=f, file_name=zip_name)
-    shutil.rmtree(temp_dir)
+            status_text.text("AI is organizing the menu structure...")
+            extract_prompt = f"Identify all menu items from this HTML. Return ONLY a valid JSON list of strings like ['Dish 1', 'Dish 2']. HTML: {raw_html[:20000]}"
+            extraction = model.generate_content(extract_prompt)
+            clean_json = extraction.text.replace('```json', '').replace('```', '').strip()
+            structured_menu = json.loads(clean_json)
+        except Exception as e:
+            st.error(f"Scraping failed: {e}")
+            st.stop()
+
+        # B. VISION MATCHING (Full-Return Fix)
+        temp_dir = f"./{brand_name}_output"
+        if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        progress_bar = st.progress(0)
+        name_tracker = {}
+        total_files = len(uploaded_files)
+
+        # Process in batches of 5 for memory safety
+        for i in range(0, total_files, 5):
+            batch = uploaded_files[i : i + 5]
+            for file in batch:
+                file_bytes = file.getvalue()
+                matched_name = "Unmatched" # Fallback
+                
+                try:
+                    # Match photo to the structured menu items
+                    match_resp = model.generate_content([
+                        f"From this list: {structured_menu}, what is this? Return ONLY the dish name. If unsure, say 'Unmatched'.",
+                        {"mime_type": "image/jpeg", "data": file_bytes}
+                    ])
+                    if match_resp and match_resp.text:
+                        matched_name = match_resp.text.strip()
+                except:
+                    pass # Keep 'Unmatched' name if API fails
+                
+                # Sanitize & Save (Binary Fix)
+                clean_name = re.sub(r'[^a-zA-Z0-9]', '_', matched_name).strip("_")
+                count = name_tracker.get(clean_name, 0)
+                name_tracker[clean_name] = count + 1
+                suffix = f"_{count}" if count > 0 else ""
+                
+                dest_path = os.path.join(temp_dir, f"{clean_name}{suffix}.jpg")
+                with open(dest_path, "wb") as f:
+                    f.write(file_bytes)
+            
+            # Progress bar range safety
+            progress_bar.progress(min(100, int((i + 5) / total_files * 100)))
+
+        # C. ZIP & DOWNLOAD
+        zip_name = f"{brand_name}_Photos.zip"
+        with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as z:
+            for f in os.listdir(temp_dir):
+                z.write(os.path.join(temp_dir, f), f)
+        
+        status_text.success(f"Success! All {total_files} images processed.")
+        with open(zip_name, "rb") as f:
+            st.download_button("💾 Download ZIP Result", data=f, file_name=zip_name)
+        
+        shutil.rmtree(temp_dir) # RAM cleanup
